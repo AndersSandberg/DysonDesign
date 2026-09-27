@@ -24,6 +24,41 @@ python -m pytest tests/
 
 Parameters are set in `CONFIG` / `CONFIG_AB` at the top of the script.
 
+## Growth model
+
+`dyson_growth.py` is a fast throughput ODE for bootstrapping a swarm from
+asteroid feedstock: self-replicating machinery in the belt turns feedstock
+into collectors, which are transferred to radius r and beam power back.
+It asks how long it takes to capture a fraction f of the solar luminosity,
+and where the collectors should go.
+
+```
+python dyson_growth.py --f 0.1 --r 1.0 --tau 1.0 --sigma 1e-3
+```
+
+Main results, all checked in `tests/test_dyson_growth.py`:
+
+- Balanced growth solves an Euler-Lotka equation,
+  lambda t_E = (1 - lambda tau) exp(-lambda D), where tau is the machinery
+  replication time, t_E the collectors' energy payback time and D the
+  transit delay. To first order, 1/lambda = tau + t_E + D: the three add
+  in series.
+- For thin films (sigma ~ 1e-3 kg/m^2), t_E is 20-60 minutes, so energy
+  never limits growth; replication time and transit delay do.
+- The time-optimal policy is bang-bang: build machinery until it equals the
+  target collector mass, then spend one tau building collectors
+  (as in Cohen 1971 and Macevicz & Oster 1976).
+  T* = tau (ln(M/K0) + 1) + D.
+- Collector mass scales as r^2, but time depends on it only through
+  ln(M), so the choice of radius is weak. It is set by the transit delay
+  and the collectors' thermal limit, and capped by feedstock.
+
+Figures: `figures/growth_trajectory.png`, `figures/growth_time_vs_radius.png`,
+`figures/growth_feedstock_frontier.png`.
+
+Not yet included: self-shading, Mercury as feedstock, recycling machinery
+into collectors at the end, and sail-spiral transfer instead of Hohmann.
+
 ## Numerical notes
 
 - Test particle elements are heliocentric.
