@@ -8,7 +8,8 @@ Features:
   - Row-based checkpointing (saves after every N rows)
   - Auto-resume from partial results
 
-Requires: pip install rebound numpy matplotlib tqdm
+Requires: pip install -r requirements.txt  (REBOUND 4.x or 5.x)
+Tests:    python -m pytest tests/
 """
 
 import numpy as np
@@ -21,6 +22,7 @@ import warnings
 import os
 import time
 import json
+from math import gcd
 warnings.filterwarnings('ignore')
 
 # ============================================================
@@ -43,11 +45,13 @@ CONFIG = {
 # J2000 Orbital Elements (hardcoded - no network needed)
 # Source: JPL Horizons, epoch J2000.0 (JD 2451545.0)
 # Format: (a [AU], e, inc [deg], Omega [deg], omega [deg], M [deg], mass [Msun])
+# Note: omega is the argument of perihelion (varpi - Omega), not the longitude
+# of perihelion varpi. For Earth, varpi = 102.937 deg and Omega = -11.261 deg.
 # ============================================================
 PLANET_ELEMENTS = {
     'Mercury': (0.38710, 0.20563, 7.005, 48.331, 29.124, 174.796, 1.6601e-7),
     'Venus':   (0.72333, 0.00677, 3.395, 76.680, 54.884, 50.416,  2.4478e-6),
-    'Earth':   (1.00000, 0.01671, 0.000, -11.261, 102.937, 357.517, 3.0027e-6),
+    'Earth':   (1.00000, 0.01671, 0.000, -11.261, 114.198, 357.517, 3.0027e-6),
     'Mars':    (1.52368, 0.09340, 1.850, 49.558, 286.502, 19.373,  3.2272e-7),
     'Jupiter': (5.20260, 0.04849, 1.303, 100.464, 273.867, 20.020, 9.5479e-4),
     'Saturn':  (9.55491, 0.05551, 2.489, 113.666, 339.392, 317.020, 2.8588e-4),
@@ -80,7 +84,7 @@ def get_resonance_locations(a_min, a_max, lightness=0.0):
         a_p = PLANET_A[planet_name]
         for p in range(1, 8):
             for q in range(1, 8):
-                if p == q:
+                if p == q or gcd(p, q) != 1:
                     continue
                 a_res = a_p * (q / p) ** (2.0 / 3.0) * beta_shift
                 if a_min <= a_res <= a_max:
@@ -121,9 +125,36 @@ def create_solar_system_sim():
 # ============================================================
 # Solar sail radiation pressure force
 # ============================================================
-# Module-level variable for the force callback (safe with multiprocessing:
+# Module-level state for the force callback (safe with multiprocessing:
 # each worker process gets its own copy of module globals)
 _LIGHTNESS = 0.0
+_FORCE_CALLS = 0        # number of successful callback invocations
+_FORCE_ERROR = None     # first exception raised inside the callback, if any
+
+
+def _variational_particles(sim):
+    """
+    Return (n_real, var) where var[k] is the first-order variational
+    particle shadowing real particle k, or var is None if there are none.
+
+    REBOUND >= 5 keeps variational particles in sim.particles_var and
+    sim.N counts only real particles; REBOUND 4.x appends them to
+    sim.particles and sim.N includes them.
+    """
+    if hasattr(sim, 'particles_var'):
+        return sim.N, (sim.particles_var if sim.N_var > 0 else None)
+    n_real = sim.N - sim.N_var
+    if sim.N_var == 0:
+        return n_real, None
+    ps = sim.particles
+    return n_real, [ps[n_real + k] for k in range(n_real)]
+
+
+def get_test_particle(sim):
+    """Return the test particle (last real particle), for any REBOUND version."""
+    n_real, _ = _variational_particles(sim)
+    return sim.particles[n_real - 1]
+
 
 def _radiation_force(reb_sim):
     """
@@ -138,48 +169,150 @@ def _radiation_force(reb_sim):
     
     Applied to the shadow displacement delta_r:
         delta_a_i = C * (delta_r_i / r^3  -  3 * r_i * (r . delta_r) / r^5)
+
+    Exceptions raised here are swallowed by ctypes, so they are recorded in
+    _FORCE_ERROR and re-raised by the caller after integration.
     """
+    global _FORCE_CALLS, _FORCE_ERROR
     if _LIGHTNESS == 0.0:
         return
-    sim = reb_sim.contents
-    ps = sim.particles
-    sun = ps[0]
-    n_real = sim.N_real
-    tp_idx = n_real - 1  # test particle is last real particle
-    tp = ps[tp_idx]
-    
-    dx = tp.x - sun.x
-    dy = tp.y - sun.y
-    dz = tp.z - sun.z
-    r2 = dx * dx + dy * dy + dz * dz
-    r3 = r2 * r2 ** 0.5
-    
-    C = _LIGHTNESS * sim.G * sun.m
-    
-    # --- Force on real test particle ---
-    f = C / r3
-    tp.ax += f * dx
-    tp.ay += f * dy
-    tp.az += f * dz
-    
-    # --- Variational force on shadow particle (needed for MEGNO) ---
-    if sim.N > n_real:
-        r5 = r3 * r2
-        shadow_tp = ps[tp_idx + n_real]
-        shadow_sun = ps[n_real]  # shadow particle for Sun
-        
-        # Deviation of relative position (test particle - Sun)
-        ddx = shadow_tp.x - shadow_sun.x
-        ddy = shadow_tp.y - shadow_sun.y
-        ddz = shadow_tp.z - shadow_sun.z
-        
-        # r . delta_r
-        rddr = dx * ddx + dy * ddy + dz * ddz
-        
-        # Jacobian applied to deviation
-        shadow_tp.ax += C * (ddx / r3 - 3.0 * dx * rddr / r5)
-        shadow_tp.ay += C * (ddy / r3 - 3.0 * dy * rddr / r5)
-        shadow_tp.az += C * (ddz / r3 - 3.0 * dz * rddr / r5)
+    try:
+        sim = reb_sim.contents
+        n_real, var = _variational_particles(sim)
+        ps = sim.particles
+        sun = ps[0]
+        tp_idx = n_real - 1  # test particle is last real particle
+        tp = ps[tp_idx]
+
+        dx = tp.x - sun.x
+        dy = tp.y - sun.y
+        dz = tp.z - sun.z
+        r2 = dx * dx + dy * dy + dz * dz
+        r3 = r2 * r2 ** 0.5
+
+        C = _LIGHTNESS * sim.G * sun.m
+
+        # --- Force on real test particle ---
+        f = C / r3
+        tp.ax += f * dx
+        tp.ay += f * dy
+        tp.az += f * dz
+
+        # --- Variational force on shadow particle (needed for MEGNO) ---
+        if var is not None:
+            r5 = r3 * r2
+            shadow_tp = var[tp_idx]
+            shadow_sun = var[0]
+
+            # Deviation of relative position (test particle - Sun)
+            ddx = shadow_tp.x - shadow_sun.x
+            ddy = shadow_tp.y - shadow_sun.y
+            ddz = shadow_tp.z - shadow_sun.z
+
+            # r . delta_r
+            rddr = dx * ddx + dy * ddy + dz * ddz
+
+            # Jacobian applied to deviation
+            shadow_tp.ax += C * (ddx / r3 - 3.0 * dx * rddr / r5)
+            shadow_tp.ay += C * (ddy / r3 - 3.0 * dy * rddr / r5)
+            shadow_tp.az += C * (ddz / r3 - 3.0 * dz * rddr / r5)
+
+        _FORCE_CALLS += 1
+    except Exception as ex:
+        if _FORCE_ERROR is None:
+            _FORCE_ERROR = ex
+
+
+def check_force_status():
+    """Raise if the radiation force callback failed or never ran."""
+    if _LIGHTNESS == 0.0:
+        return
+    if _FORCE_ERROR is not None:
+        raise RuntimeError(
+            f"Radiation force callback failed: {type(_FORCE_ERROR).__name__}: {_FORCE_ERROR}"
+        ) from _FORCE_ERROR
+    if _FORCE_CALLS == 0:
+        raise RuntimeError("Radiation force callback was never called")
+
+
+# ============================================================
+# Timestep selection
+# ============================================================
+PLANET_DT = 0.025  # yr; ~P_Mercury/10. Planets-only MEGNO = 2.000 over 5e3 yr for dt in [0.006, 0.025]
+TP_DT_FRACTION = 0.05  # test particle timestep as fraction of its pericentre timescale
+SPLIT_TOL = 3e-3       # bound on beta/(1-beta) * (n dt)^2; gives ~1e-3 relative orbit error
+
+
+def choose_timestep(a, e_test, lightness):
+    """
+    WHFast timestep for the planets plus one test particle.
+
+    The planets need at most PLANET_DT. The test particle needs a fraction of
+    its Keplerian pericentre timescale P (1-e)^{3/2} / (1+e)^{1/2}.
+
+    With radiation pressure the Kepler drift still uses GM_sun, while the
+    effective central force is GM_sun (1-beta), so the radiation kick is not
+    a small perturbation: eps = beta/(1-beta), which is 9 at beta = 0.9.
+    The Wisdom-Holman splitting error scales as eps * (n dt)^2. Measured for
+    a two-body sail orbit, the relative radius excursion is ~0.3 eps (n dt)^2
+    for beta in [0.3, 0.99], so dt is chosen to keep eps (n dt)^2 <= SPLIT_TOL.
+    The cost grows as sqrt(eps) / P, i.e. steeply for high beta near the Sun.
+    """
+    if not 0.0 <= lightness < 1.0:
+        raise ValueError(f"lightness must be in [0, 1), got {lightness}")
+    period = a ** 1.5  # yr, with G M_sun = 4 pi^2
+    t_peri = period * (1.0 - e_test) ** 1.5 / (1.0 + e_test) ** 0.5
+    dt = min(PLANET_DT, TP_DT_FRACTION * t_peri)
+    if lightness > 0.0:
+        eps = lightness / (1.0 - lightness)
+        dt = min(dt, t_peri / (2.0 * np.pi) * (SPLIT_TOL / eps) ** 0.5)
+    return dt
+
+
+# ============================================================
+# Test particle setup
+# ============================================================
+def setup_test_particle_sim(a, inc_deg, e_test, lightness):
+    """
+    Build Sun + planets + one massless test particle, ready for MEGNO.
+
+    The test particle's elements are heliocentric. For a sail with lightness
+    beta, its heliocentric velocity is scaled by sqrt(1-beta), which gives the
+    same (a, e) in the effective potential -GM(1-beta)/r for any anomaly.
+    """
+    global _LIGHTNESS, _FORCE_CALLS, _FORCE_ERROR
+    _LIGHTNESS = lightness
+    _FORCE_CALLS = 0
+    _FORCE_ERROR = None
+
+    sim = create_solar_system_sim()
+    sim.integrator = "whfast"
+    sim.dt = choose_timestep(a, e_test, lightness)
+
+    sun = sim.particles[0]
+    sim.add(
+        primary=sun,
+        m=0.0, a=a, e=e_test,
+        inc=np.radians(inc_deg),
+        Omega=0.0, omega=0.0, M=0.0,
+    )
+
+    if lightness > 0.0:
+        sun = sim.particles[0]
+        tp = sim.particles[sim.N - 1]
+        scale = (1.0 - lightness) ** 0.5
+        tp.vx = sun.vx + scale * (tp.vx - sun.vx)
+        tp.vy = sun.vy + scale * (tp.vy - sun.vy)
+        tp.vz = sun.vz + scale * (tp.vz - sun.vz)
+
+    sim.move_to_com()
+
+    if lightness > 0.0:
+        sim.additional_forces = _radiation_force
+        sim.force_is_velocity_dependent = 0
+
+    sim.init_megno()
+    return sim
 
 
 # ============================================================
@@ -189,61 +322,24 @@ def compute_megno_single(args):
     """
     Compute MEGNO for a single test particle at (a, inc).
     Takes a tuple (a, inc_deg, e_test, lightness, integration_time) for multiprocessing.
-    Returns MEGNO value or NaN on failure.
+    Returns MEGNO value or NaN on integration failure.
+    Raises RuntimeError if the radiation force callback failed.
     """
     a, inc_deg, e_test, lightness, integration_time = args
-    
-    # Set module-level lightness for the force callback
-    global _LIGHTNESS
-    _LIGHTNESS = lightness
-    
+
     try:
-        sim = create_solar_system_sim()
-
-        sim.integrator = "whfast"
-        sim.dt = min(a ** 1.5, 0.5) * 0.05
-
-        # Add test particle BEFORE init_megno
-        sim.add(
-            m=0.0, a=a, e=e_test,
-            inc=np.radians(inc_deg),
-            Omega=0.0, omega=0.0, M=0.0,
-        )
-        
-        # Adjust velocity for solar sail: circular orbit in effective potential
-        # needs v_circ = v_kepler * sqrt(1 - beta)
-        if lightness > 0.0 and lightness < 1.0:
-            tp = sim.particles[sim.N - 1]  # test particle (last added)
-            scale = (1.0 - lightness) ** 0.5
-            tp.vx *= scale
-            tp.vy *= scale
-            tp.vz *= scale
-
-        sim.move_to_com()
-        
-        # Enable radiation pressure force
-        if lightness > 0.0:
-            sim.additional_forces = _radiation_force
-            sim.force_is_velocity_dependent = 0
-        
-        sim.init_megno()
-
-        # Integrate
-        n_steps = max(100, int(integration_time / (a ** 1.5 * 0.5)))
-        n_steps = min(n_steps, 5000)
-
-        times = np.linspace(0, integration_time, n_steps)
-        for t in times[1:]:
-            sim.integrate(t)
-
+        sim = setup_test_particle_sim(a, inc_deg, e_test, lightness)
+        # A single call without exact_finish_time keeps every WHFast step
+        # symplectic; only the final MEGNO value is used.
+        sim.integrate(integration_time, exact_finish_time=0)
         megno = sim.megno()
-        if np.isfinite(megno) and megno > 0:
-            return megno
-        else:
-            return np.nan
-
     except Exception:
         return np.nan
+
+    check_force_status()
+    if np.isfinite(megno) and megno > 0:
+        return megno
+    return np.nan
 
 
 def compute_row(args):
@@ -643,6 +739,45 @@ def plot_from_file(npz_path, config):
 
 
 # ============================================================
+# Diagnostic
+# ============================================================
+def run_diagnostic(inc_deg, beta, a=1.5):
+    """
+    Integrate one test particle and check that MEGNO is computed and, for
+    beta > 0, that the radiation force is really applied: a circular sail
+    orbit must keep its heliocentric radius. (Without the force it would
+    follow a Keplerian ellipse with e = beta and aphelion at a.)
+    Returns True on success.
+    """
+    print(f"Running diagnostic (a={a} AU, i={inc_deg}deg, beta={beta})...")
+    try:
+        sim = setup_test_particle_sim(a, inc_deg, 0.0, beta)
+        print(f"  Particles: {sim.N}, REBOUND {rebound.__version__}, dt={sim.dt:.4g} yr")
+        radii = []
+        for t in np.linspace(1.0, 100.0, 200):
+            sim.integrate(t, exact_finish_time=0)
+            tp, sun = get_test_particle(sim), sim.particles[0]
+            radii.append(np.sqrt((tp.x - sun.x) ** 2 + (tp.y - sun.y) ** 2 + (tp.z - sun.z) ** 2))
+        print(f"  MEGNO after 100 yr:  {sim.megno():.4f}")
+        sim.integrate(1000.0, exact_finish_time=0)
+        print(f"  MEGNO after 1000 yr: {sim.megno():.4f}")
+        check_force_status()
+        r_min, r_max = min(radii), max(radii)
+        print(f"  Heliocentric r over 100 yr: [{r_min:.4f}, {r_max:.4f}] AU")
+        if (r_max - r_min) / a > 0.05:
+            raise RuntimeError(
+                f"test particle radius varies by {(r_max - r_min) / a:.1%}; "
+                "expected a near-circular orbit"
+            )
+        print("  Diagnostic PASSED")
+        return True
+    except Exception as ex:
+        print(f"  Diagnostic FAILED: {type(ex).__name__}: {ex}")
+        print("  Fix this before running the full grid!")
+        return False
+
+
+# ============================================================
 # Main
 # ============================================================
 def main():
@@ -658,44 +793,7 @@ def main():
     print()
 
     # ---- Quick diagnostic ----
-    beta = CONFIG['lightness']
-    print(f"Running diagnostic (a=1.5 AU, i=10deg, beta={beta})...")
-    try:
-        sim = create_solar_system_sim()
-        sim.integrator = "whfast"
-        sim.dt = 0.05
-        print(f"  Particles: {sim.N}, REBOUND {rebound.__version__}")
-
-        sim.add(m=0.0, a=1.5, e=0.0, inc=np.radians(10), Omega=0, omega=0, M=0)
-        
-        # Adjust velocity for sail
-        if beta > 0.0 and beta < 1.0:
-            tp = sim.particles[sim.N - 1]
-            scale = (1.0 - beta) ** 0.5
-            tp.vx *= scale
-            tp.vy *= scale
-            tp.vz *= scale
-            print(f"  Velocity scaled by sqrt(1-beta) = {scale:.4f}")
-        
-        sim.move_to_com()
-        
-        if beta > 0.0:
-            global _LIGHTNESS
-            _LIGHTNESS = beta
-            sim.additional_forces = _radiation_force
-            sim.force_is_velocity_dependent = 0
-            print(f"  Radiation pressure enabled (beta={beta})")
-        
-        sim.init_megno()
-
-        sim.integrate(100.0)
-        print(f"  MEGNO after 100 yr:  {sim.megno():.4f}")
-        sim.integrate(1000.0)
-        print(f"  MEGNO after 1000 yr: {sim.megno():.4f}")
-        print("  Diagnostic PASSED")
-    except Exception as ex:
-        print(f"  Diagnostic FAILED: {type(ex).__name__}: {ex}")
-        print("  Fix this before running the full grid!")
+    if not run_diagnostic(10.0, CONFIG['lightness']):
         return
     print()
 
@@ -937,7 +1035,7 @@ def plot_ab_map(a_values, beta_values, megno_map, config, save=True):
         color = color_map[planet_name]
         for p in range(1, 8):
             for q in range(1, 8):
-                if p == q:
+                if p == q or gcd(p, q) != 1:
                     continue
                 order = abs(p - q)
                 if order > 2:
@@ -1022,29 +1120,7 @@ def main_ab():
 
     # ---- Diagnostic ----
     beta_diag = min(0.3, config['beta_range'][1])
-    print(f"Running diagnostic (a=1.5 AU, i={config['inc_deg']}deg, beta={beta_diag})...")
-    try:
-        global _LIGHTNESS
-        _LIGHTNESS = beta_diag
-        sim = create_solar_system_sim()
-        sim.integrator = "whfast"
-        sim.dt = 0.05
-        sim.add(m=0.0, a=1.5, e=0.0, inc=np.radians(config['inc_deg']),
-                Omega=0, omega=0, M=0)
-        tp = sim.particles[sim.N - 1]
-        scale = (1.0 - beta_diag) ** 0.5
-        tp.vx *= scale; tp.vy *= scale; tp.vz *= scale
-        sim.move_to_com()
-        sim.additional_forces = _radiation_force
-        sim.force_is_velocity_dependent = 0
-        sim.init_megno()
-        sim.integrate(100.0)
-        print(f"  MEGNO after 100 yr:  {sim.megno():.4f}")
-        sim.integrate(1000.0)
-        print(f"  MEGNO after 1000 yr: {sim.megno():.4f}")
-        print("  Diagnostic PASSED")
-    except Exception as ex:
-        print(f"  Diagnostic FAILED: {type(ex).__name__}: {ex}")
+    if not run_diagnostic(config['inc_deg'], beta_diag):
         return
     print()
 
